@@ -1,0 +1,95 @@
+package main
+
+import (
+	"flag"
+	"fmt"
+
+	"log"
+	"os"
+	"path"
+	"time"
+
+	htnstratum "github.com/HoosatNetwork/htn-stratum-bridge/src/htnstratum"
+	"github.com/HoosatNetwork/htn-stratum-bridge/src/pow"
+	"gopkg.in/yaml.v2"
+)
+
+func main() {
+	pwd, _ := os.Getwd()
+	fullPath := path.Join(pwd, "config.yaml")
+	log.Printf("loading config @ `%s`", fullPath)
+	rawCfg, err := os.ReadFile(fullPath)
+	if err != nil {
+		log.Printf("config file not found: %s", err)
+		os.Exit(1)
+	}
+	cfg := htnstratum.BridgeConfig{}
+	if err := yaml.Unmarshal(rawCfg, &cfg); err != nil {
+		log.Printf("failed parsing config file: %s", err)
+		os.Exit(1)
+	}
+
+	// override flag.Usage for better help output.
+	flag.Usage = func() {
+		flag.VisitAll(func(f *flag.Flag) {
+			fmt.Fprintf(os.Stderr, "  -%v %v\n", f.Name, f.Value)
+			fmt.Fprintf(os.Stderr, "    	%v (default \"%v\")\n", f.Usage, f.Value)
+		})
+	}
+
+	cfg.RemoveDisconnectedFromStats = true // Default to true
+	pow.SetUseHoohashCLibrary(true)        // Enables C library only on aarch64 Linux - everything else ignores this
+
+	flag.StringVar(&cfg.StratumPort, "stratum", cfg.StratumPort, "stratum port to listen on")
+	flag.BoolVar(&cfg.PrintStats, "stats", cfg.PrintStats, "true to show periodic stats to console")
+	flag.StringVar(&cfg.RPCServer, "hoosat_address", cfg.RPCServer, "address of the spectred node")
+	flag.DurationVar(&cfg.BlockWaitTime, "blockwait", cfg.BlockWaitTime, "time in ms to wait before manually requesting new block")
+	flag.Float64Var(&cfg.MinShareDiff, "mindiff", cfg.MinShareDiff, "minimum share difficulty to accept from miner(s)")
+	flag.BoolVar(&cfg.VarDiff, "vardiff", cfg.VarDiff, "true to enable auto-adjusting variable min diff")
+	flag.UintVar(&cfg.SharesPerMin, "sharespermin", cfg.SharesPerMin, "number of shares per minute the vardiff engine should target")
+	flag.BoolVar(&cfg.VarDiffStats, "vardiffstats", cfg.VarDiffStats, "include vardiff stats readout every 10s in log")
+	flag.BoolVar(&cfg.SoloMining, "solo", cfg.SoloMining, "true to use network diff instead of stratum vardiff")
+	flag.UintVar(&cfg.ExtranonceSize, "extranonce", cfg.ExtranonceSize, "size in bytes of extranonce")
+	flag.StringVar(&cfg.PromPort, "prom", cfg.PromPort, "address to serve prom stats")
+	flag.BoolVar(&cfg.UseLogFile, "log", cfg.UseLogFile, "if true will output errors to log file")
+	flag.StringVar(&cfg.HealthCheckPort, "hcp", cfg.HealthCheckPort, "(rarely used) if defined will expose a health check on /readyz")
+	flag.BoolVar(&cfg.MineWhenNotSynced, "minewhennotsynced", cfg.MineWhenNotSynced, "mine when not synced")
+	flag.Int64Var(&cfg.Poll, "poll", cfg.Poll, "Poll id for voting on blocks")
+	flag.Int64Var(&cfg.Vote, "vote", cfg.Vote, "Vote id of the poll for voting on blocks")
+	flag.BoolVar(&cfg.RemoveDisconnectedFromStats, "remove_disconnected_from_stats", cfg.RemoveDisconnectedFromStats,
+		"when true, remove disconnected clients from printed stats (default: true)")
+
+	flag.Parse()
+
+	if cfg.MinShareDiff == 0 {
+		cfg.MinShareDiff = 4
+	}
+	if cfg.BlockWaitTime == 0 {
+		cfg.BlockWaitTime = 100 * time.Millisecond // this should never happen due to HTN 200ms block times
+	}
+
+	log.Println("----------------------------------")
+	log.Printf("initializing bridge")
+	log.Printf("hoosat:\t\t\t%s", cfg.RPCServer)
+	log.Printf("stratum:\t\t\t%s", cfg.StratumPort)
+	log.Printf("prom:\t\t\t%s", cfg.PromPort)
+	log.Printf("stats:\t\t\t%t", cfg.PrintStats)
+	log.Printf("log:\t\t\t%t", cfg.UseLogFile)
+	log.Printf("min diff:\t\t\t%.10f", cfg.MinShareDiff)
+	log.Printf("var diff:\t\t\t%t", cfg.VarDiff)
+	log.Printf("shares per min:\t\t%d", cfg.SharesPerMin)
+	log.Printf("var diff stats:\t\t%t", cfg.VarDiffStats)
+	log.Printf("solo mining:\t\t%t", cfg.SoloMining)
+	log.Printf("block wait:\t\t\t%s", cfg.BlockWaitTime)
+	log.Printf("extranonce size:\t\t%d", cfg.ExtranonceSize)
+	log.Printf("health check:\t\t\t%s", cfg.HealthCheckPort)
+	log.Printf("Mine when not synced:\t%t", cfg.MineWhenNotSynced)
+	log.Printf("Poll id:\t\t\t%d", cfg.Poll)
+	log.Printf("Vote id:\t\t\t%d", cfg.Vote)
+	log.Printf("remove disconnected from stats:\t%t", cfg.RemoveDisconnectedFromStats)
+	log.Println("----------------------------------")
+
+	if err := htnstratum.ListenAndServe(cfg); err != nil {
+		log.Println(err)
+	}
+}

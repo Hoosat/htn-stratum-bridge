@@ -1,0 +1,258 @@
+package htnstratum
+
+import (
+	"fmt"
+	"math"
+	"regexp"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/HoosatNetwork/htn-stratum-bridge/src/gostratum"
+	"github.com/pkg/errors"
+	"go.uber.org/zap"
+)
+
+var bigJobRegex = regexp.MustCompile(".*BzMiner.*")
+
+const balanceDelay = time.Minute
+
+type clientListener struct {
+	logger                      *zap.SugaredLogger
+	shareHandler                *shareHandler
+	clientLock                  sync.RWMutex
+	clients                     map[int32]*gostratum.StratumContext
+	lastBalanceCheck            time.Time
+	lastNotSyncedLog            time.Time
+	clientCounter               int32
+	minShareDiff                float64
+	extranonceSize              int8
+	maxExtranonce               int32
+	nextExtranonce              int32
+	removeDisconnectedFromStats bool
+}
+
+func newClientListener(logger *zap.SugaredLogger, shareHandler *shareHandler, minShareDiff float64, extranonceSize int8, removeDisconnectedFromStats bool) *clientListener {
+	return &clientListener{
+		logger:                      logger,
+		minShareDiff:                minShareDiff,
+		extranonceSize:              extranonceSize,
+		maxExtranonce:               int32(math.Pow(2, (8*math.Min(float64(extranonceSize), 3))) - 1),
+		nextExtranonce:              0,
+		clientLock:                  sync.RWMutex{},
+		shareHandler:                shareHandler,
+		clients:                     make(map[int32]*gostratum.StratumContext),
+		removeDisconnectedFromStats: removeDisconnectedFromStats,
+	}
+}
+
+func (c *clientListener) OnConnect(ctx *gostratum.StratumContext) {
+	var extranonce int32
+
+	idx := atomic.AddInt32(&c.clientCounter, 1)
+	ctx.Id = idx
+	c.clientLock.Lock()
+	if c.extranonceSize > 0 {
+		extranonce = c.nextExtranonce
+		if c.nextExtranonce < c.maxExtranonce {
+			c.nextExtranonce++
+		} else {
+			c.nextExtranonce = 0
+			c.logger.Warn("wrapped extranonce! new clients may be duplicating work...")
+		}
+	}
+	c.clients[idx] = ctx
+	c.clientLock.Unlock()
+	ctx.Logger = ctx.Logger.With(zap.Int("client_id", int(ctx.Id)))
+
+	if c.extranonceSize > 0 {
+		ctx.Extranonce = fmt.Sprintf("%0*x", c.extranonceSize*2, extranonce)
+	}
+	// Foztor - do not do here, we end up with port scanners being tracked.
+	// go func() {
+	// // hacky, but give time for the authorize to go through so we can use the worker name
+	// time.Sleep(5 * time.Second)
+	// c.shareHandler.getCreateStats(ctx) // create the stats if they don't exist
+	// }()
+}
+
+func (c *clientListener) OnDisconnect(ctx *gostratum.StratumContext) {
+	ctx.Done()
+	c.clientLock.Lock()
+	c.logger.Debug("removing client ", ctx.Id)
+	delete(c.clients, ctx.Id)
+	c.logger.Info("removed client ", ctx.Id)
+	c.clientLock.Unlock()
+	// Remove per-client stats so the disconnected client no longer appears in
+	// the rolling/printed stats table.
+	if c.shareHandler != nil && c.removeDisconnectedFromStats {
+		c.shareHandler.removeStats(ctx)
+	}
+	RecordDisconnect(ctx)
+}
+
+func (c *clientListener) NewBlockAvailable(htnApi *HtnApi, soloMining bool, poll int64, vote int64, mineWhenNotSynced bool) {
+	if !mineWhenNotSynced && !htnApi.IsSynced() {
+		if time.Since(c.lastNotSyncedLog) > 30*time.Second {
+			c.logger.Warn("HTN is not synced; mining is paused (set mine_when_not_synced: true to override)")
+			c.lastNotSyncedLog = time.Now()
+		}
+		return
+	}
+
+	if mineWhenNotSynced && !htnApi.IsSynced() {
+		if time.Since(c.lastNotSyncedLog) > 30*time.Second {
+			c.logger.Warn("HTN is not synced; when_not_synced is current DISABLED, please wait")
+			c.lastNotSyncedLog = time.Now()
+		}
+		return
+	}
+
+	c.clientLock.Lock()
+	addresses := make([]string, 0, len(c.clients))
+	for _, cl := range c.clients {
+		if !cl.Connected() {
+			continue
+		}
+		go func(client *gostratum.StratumContext) {
+			state := GetMiningState(client)
+			if client.WalletAddr == "" {
+				if time.Since(state.connectTime) > time.Second*20 { // timeout passed
+					// this happens pretty frequently in gcp/aws land since script-kiddies scrape ports
+					client.Logger.Warn("client misconfigured, no miner address specified - disconnecting", zap.String("client", client.String()))
+					RecordWorkerError(client.WalletAddr, ErrNoMinerAddress)
+					client.Disconnect() // invalid configuration, boot the worker
+				}
+				return
+			}
+			template, err := htnApi.GetBlockTemplate(client, poll, vote)
+			if err != nil {
+				if strings.Contains(err.Error(), "Could not decode address") {
+					RecordWorkerError(client.WalletAddr, ErrInvalidAddressFmt)
+					client.Logger.Error("miner address is not a valid hoosat address")
+					client.Disconnect() // unrecoverable
+				} else {
+					RecordWorkerError(client.WalletAddr, ErrFailedBlockFetch)
+					client.Logger.Error(plainNodeError(err))
+				}
+				return
+			}
+			state.bigDiff = CalculateTarget(uint64(template.Block.Header.Bits))
+			header, err := SerializeBlockHeader(template.Block)
+			if err != nil {
+				RecordWorkerError(client.WalletAddr, ErrBadDataFromMiner)
+				client.Logger.Error(fmt.Sprintf("failed to serialize block header: %s", err))
+				return
+			}
+
+			jobId := state.AddJob(template.Block)
+			if !state.initialized {
+				state.initialized = true
+				state.useBigJob = bigJobRegex.MatchString(client.RemoteApp)
+				// first pass through send the difficulty since it's fixed
+				state.stratumDiff = newHoosatDiff()
+				state.stratumDiff.setDiffValue(c.minShareDiff)
+				if !soloMining {
+					sendClientDiff(client, state)
+				}
+				c.shareHandler.setClientVardiff(client, c.minShareDiff)
+			}
+
+			varDiff := TargetToDiff(&state.bigDiff)
+			c.shareHandler.setSoloDiff(varDiff)
+			if !soloMining {
+				varDiff = c.shareHandler.getClientVardiff(client)
+			}
+
+			// Guard against race where stratumDiff isn't initialized yet
+			currentDiff := 0.0
+			if state.stratumDiff != nil {
+				currentDiff = state.stratumDiff.diffValue
+			}
+
+			if varDiff == 0 {
+				// If vardiff not computed, fall back to current or default
+				if state.stratumDiff == nil {
+					state.stratumDiff = newHoosatDiff()
+					state.stratumDiff.setDiffValue(c.minShareDiff)
+					currentDiff = state.stratumDiff.diffValue
+				}
+				varDiff = currentDiff
+			}
+
+			if state.stratumDiff == nil || varDiff != currentDiff {
+				// send updated vardiff
+				if state.stratumDiff == nil {
+					state.stratumDiff = newHoosatDiff()
+				}
+				if !soloMining {
+					client.Logger.Debug(fmt.Sprintf("changing diff from %.10f to %.10f", currentDiff, varDiff))
+				}
+				state.stratumDiff.setDiffValue(varDiff)
+				sendClientDiff(client, state)
+				c.shareHandler.startClientVardiff(client)
+			}
+
+			jobParams := []any{fmt.Sprintf("%d", jobId)}
+			if state.useBigJob {
+				jobParams = append(jobParams, GenerateLargeJobParams(header, uint64(template.Block.Header.Timestamp)))
+			} else {
+				jobParams = append(jobParams, GenerateJobHeader(header))
+				jobParams = append(jobParams, template.Block.Header.Timestamp)
+			}
+
+			// // normal notify flow
+			if err := client.Send(gostratum.JsonRpcEvent{
+				Version: "2.0",
+				Method:  "mining.notify",
+				Id:      jobId,
+				Params:  jobParams,
+			}); err != nil {
+				if errors.Is(err, gostratum.ErrorDisconnected) {
+					RecordWorkerError(client.WalletAddr, ErrDisconnected)
+					return
+				}
+				RecordWorkerError(client.WalletAddr, ErrFailedSendWork)
+				client.Logger.Debug(errors.Wrapf(err, "failed sending work packet %d", jobId).Error())
+			}
+
+			RecordNewJob(client)
+		}(cl)
+
+		if cl.WalletAddr != "" {
+			addresses = append(addresses, cl.WalletAddr)
+		}
+	}
+	c.clientLock.Unlock()
+
+	if time.Since(c.lastBalanceCheck) > balanceDelay {
+		c.lastBalanceCheck = time.Now()
+		if len(addresses) > 0 {
+			go func() {
+				balances, err := htnApi.hoosat.GetBalancesByAddresses(addresses)
+				if err != nil {
+					c.logger.Warn("failed to get balances from hoosat, prom stats will be out of date", zap.Error(err))
+					return
+				}
+				RecordBalances(balances)
+			}()
+		}
+	}
+}
+
+func sendClientDiff(client *gostratum.StratumContext, state *MiningState) {
+	if err := client.Send(gostratum.JsonRpcEvent{
+		Version: "2.0",
+		Method:  "mining.set_difficulty",
+		Params:  []any{state.stratumDiff.diffValue},
+	}); err != nil {
+		if errors.Is(err, gostratum.ErrorDisconnected) {
+			RecordWorkerError(client.WalletAddr, ErrDisconnected)
+			return
+		}
+		RecordWorkerError(client.WalletAddr, ErrFailedSetDiff)
+		client.Logger.Debug(errors.Wrap(err, "failed sending difficulty").Error())
+		return
+	}
+}
